@@ -57,6 +57,30 @@ SAVE_EVERY = 1
 # shaping reward is PRIZE_SHAPE_COEF * (Phi_next - Phi_now); it telescopes so it doesn't
 # distort who-won, just densifies the signal. 0 disables shaping.
 PRIZE_SHAPE_COEF = 0.1
+# Board-development term added to the shaping POTENTIAL (not a raw per-action bonus, so it
+# still telescopes and can't be reward-hacked). Rewards building/powering the Dragapult
+# line: Phi_dev = 1.0*(#Dragapult ex in play) + 0.5*(Dragapult ex w/ >=2 energy)
+# + 0.3*(#Drakloak) + 0.15*(#Dreepy). DEV_SHAPE_SCALE weights it vs the prize term inside
+# Phi; kept < 1 so taking prizes / winning dominates. 0 disables board shaping.
+DEV_SHAPE_SCALE = 0.5
+DREEPY_ID, DRAKLOAK_ID, DRAGAPULT_ID = 119, 120, 121
+
+
+def dev_potential(ps):
+    """Board-development potential for the learner (own active + bench), from card IDs."""
+    score = 0.0
+    for p in list(ps.active) + list(ps.bench):
+        if p is None:
+            continue
+        if p.id == DRAGAPULT_ID:
+            score += 1.0
+            if len(p.energies) >= 2:
+                score += 0.5
+        elif p.id == DRAKLOAK_ID:
+            score += 0.3
+        elif p.id == DREEPY_ID:
+            score += 0.15
+    return score
 # Collection mix (per game): SCRIPTED_FRACTION vs scripted bots, LEAGUE_FRACTION vs
 # frozen past selves, remainder = current-policy mirror self-play. The scripted
 # curriculum gives a strong stationary signal early; the league prevents self-play from
@@ -75,11 +99,11 @@ def load_deck(path="deck.csv"):
 
 class Transition:
     __slots__ = ("sv_enc", "sv_dec", "n_actions", "action_idx",
-                 "logprob", "value", "player", "my_prize", "opp_prize",
+                 "logprob", "value", "player", "my_prize", "opp_prize", "phi_dev",
                  "reward", "ret", "adv")
 
     def __init__(self, sv_enc, sv_dec, n_actions, action_idx, logprob, value, player,
-                 my_prize, opp_prize):
+                 my_prize, opp_prize, phi_dev):
         self.sv_enc = sv_enc
         self.sv_dec = sv_dec
         self.n_actions = n_actions
@@ -89,6 +113,7 @@ class Transition:
         self.player = player
         self.my_prize = my_prize    # learner's own prize cards remaining at this state
         self.opp_prize = opp_prize  # opponent's prize cards remaining at this state
+        self.phi_dev = phi_dev      # board-development potential at this state
         self.reward = 0.0
         self.ret = 0.0
         self.adv = 0.0
@@ -113,7 +138,8 @@ def act(obs_dict, deck, model, greedy=False):
                     float(dist.log_prob(torch.tensor(idx, device=DEVICE)).item()),
                     float(value.item()), me,
                     len(obs.current.players[me].prize),
-                    len(obs.current.players[1 - me].prize))
+                    len(obs.current.players[1 - me].prize),
+                    dev_potential(obs.current.players[me]))
     return actions[idx], tr
 
 
@@ -257,10 +283,10 @@ def finalize(transitions, result, shape_coef=0.0):
             outcome = 1.0 if result == p else -1.0
         traj[-1].reward = outcome
         if shape_coef:
+            def phi(t):
+                return (t.opp_prize - t.my_prize) + DEV_SHAPE_SCALE * t.phi_dev
             for i in range(len(traj) - 1):
-                phi_now = traj[i].opp_prize - traj[i].my_prize
-                phi_next = traj[i + 1].opp_prize - traj[i + 1].my_prize
-                traj[i].reward += shape_coef * (phi_next - phi_now)
+                traj[i].reward += shape_coef * (phi(traj[i + 1]) - phi(traj[i]))
         gae = 0.0
         next_value = 0.0
         for t in reversed(traj):
@@ -474,6 +500,8 @@ def main():
                     help="run the (costly) bot-suite evaluation + best.pth gate every N iters")
     ap.add_argument("--shape-coef", type=float, default=PRIZE_SHAPE_COEF,
                     help="prize-differential reward shaping coefficient (0 disables)")
+    ap.add_argument("--lr", type=float, default=LR,
+                    help="learning rate (use a low value, e.g. 1e-4, when --resume-ing a BC warmstart)")
     args = ap.parse_args()
     games_per_iter, eval_games = args.games, args.eval_games
     scripted_fraction, league_fraction = args.scripted_frac, args.league_frac
@@ -483,8 +511,9 @@ def main():
     log = setup_logging(run_tag)
     log.info("run %s | device=%s | %s", run_tag, DEVICE, vars(args))
     log.info("hparams | gamma=%s lambda=%s clip=%s lr=%s ppo_epochs=%s minibatch=%s "
-             "league_max=%s shape_coef=%s arch=%s", GAMMA, GAE_LAMBDA, CLIP_EPS, LR,
-             PPO_EPOCHS, MINIBATCH, LEAGUE_MAX, shape_coef, ARCH)
+             "league_max=%s shape_coef=%s dev_scale=%s arch=%s", GAMMA, GAE_LAMBDA,
+             CLIP_EPS, LR, PPO_EPOCHS, MINIBATCH, LEAGUE_MAX, shape_coef,
+             DEV_SHAPE_SCALE, ARCH)
 
     os.makedirs("out", exist_ok=True)
     league_dir = os.path.abspath(LEAGUE_DIR)
@@ -500,11 +529,14 @@ def main():
     opponents = load_opponents()
     log.info("loaded scripted opponents: %s", [o.label for o in opponents])
     model = MyModel(**ARCH).to(DEVICE)
+    resumed = False
     if args.resume and os.path.exists(args.resume):
         ck = torch.load(args.resume, map_location=DEVICE)
         model.load_state_dict(ck["state_dict"] if "state_dict" in ck else ck)
+        resumed = True
         log.info("resumed from %s", args.resume)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    log.info("learning rate %.1e", args.lr)
 
     # League state: frozen snapshots persisted on disk as snap_<id>.pth, FIFO-capped.
     league_ids: list[int] = []
@@ -532,7 +564,15 @@ def main():
     csv_file.flush()
     log.info("logging metrics to %s", csv_path)
 
+    # Safeguard: when warmstarting (e.g. from a BC clone), seed best_wr by evaluating
+    # the resumed model so a worse PPO update can't overwrite the good out/best.pth.
     best_wr = -1.0
+    if resumed:
+        model.eval()
+        best_wr, per0 = evaluate_suite(deck, model, opponents, eval_games)
+        log.info("resumed model baseline WR mean %.1f%% [%s] -- best.pth gated above this",
+                 100 * best_wr, " ".join(f"{k} {v:.0%}" for k, v in per0.items()))
+
     try:
         for it in range(args.iters):
             t0 = time.time()
