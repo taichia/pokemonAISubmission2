@@ -1,0 +1,44 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# --- Virtual environments ---
+pytorch_env/
+venv/
+.venv/
+env/
+ENV/
+
+# --- Training output / model weights ---
+# Training writes large, regenerated checkpoints to out/ (best.pth, last.pth, anchor_*) -- all
+# ignored (ephemeral). Models worth keeping (e.g. for submission) are copied into checkpoint_weights/,
+# which is re-included below (recursively, via **) so it and its subdirectories ARE tracked.
+out/*
+*.pth
+*.pt
+*.ckpt
+!checkpoint_weights/**
+
+# --- Training logs (per-run console log + metrics CSV; regenerated each run) ---
+logs/
+
+# --- Archived iterations: full on-disk snapshots (code + engine + model + logs) kept locally as a
+#     record, but NOT committed -- they duplicate large binaries (cg/) and the git history already
+#     captures the code evolution. ---
+iteration_*/
+
+# --- OS / editor noise ---
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+.vscode/
+
+# Note: cg/cg.dll and cg/libcg.so are intentionally committed (engine dependencies),
+# so .so / .dll files are deliberately NOT ignored here.
