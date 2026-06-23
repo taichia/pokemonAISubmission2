@@ -1,0 +1,8 @@
+# Only one third-party dependency. Everything else (csv, ctypes, json,
+# argparse, multiprocessing, etc.) is in the Python standard library.
+# The cg/ simulator is a precompiled native lib shipped in the repo
+# (cg.dll for Windows, libcg.so for Linux) - nothing to install for it.
+#
+# CPU works everywhere. For GPU, install a CUDA build of torch instead
+# (see SETUP.md). Pin a version if you need to match Kaggle exactly.
+torch>=2.0

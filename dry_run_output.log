@@ -1,0 +1,35 @@
+=== dry run start === 
+using python: python 
+[step1] sanity: torch + engine + deck 
+torch 2.12.1+cu130 cuda True
+deck 60
+[step2] behavioral cloning (tiny) 
+2026-06-22 13:17:05 INFO BC run 20260622_131705 | device=cuda | {'games': 8, 'epochs': 1, 'batch_size': 256, 'lr': 0.0005, 'value_coef': 0.5, 'eval_games': 4, 'out': 'out/bc.pth'}
+2026-06-22 13:17:05 INFO expert plays deck.csv; opponents: abomasnow, iono
+2026-06-22 13:17:05 INFO   gen 1/8 games | 70 samples | expert WR 0% | 0s
+2026-06-22 13:17:05 INFO   gen 2/8 games | 163 samples | expert WR 0% | 0s
+2026-06-22 13:17:05 INFO   gen 3/8 games | 209 samples | expert WR 0% | 0s
+2026-06-22 13:17:05 INFO   gen 4/8 games | 267 samples | expert WR 0% | 0s
+2026-06-22 13:17:05 INFO   gen 5/8 games | 298 samples | expert WR 0% | 0s
+2026-06-22 13:17:06 INFO   gen 6/8 games | 379 samples | expert WR 0% | 0s
+2026-06-22 13:17:06 INFO   gen 7/8 games | 475 samples | expert WR 0% | 0s
+2026-06-22 13:17:06 INFO   gen 8/8 games | 580 samples | expert WR 12% | 0s
+2026-06-22 13:17:06 INFO generated 580 samples from 8 games (expert WR 12.5%); recovered 0 decisions (0.0%) by appending the expert's exact action to the candidate set (0 discarded)
+2026-06-22 13:17:07 INFO epoch 1/1 | ce 1.7641 | vloss 0.9519 | expert-match acc 26.6%
+2026-06-22 13:17:07 INFO saved cloned weights -> out/bc.pth
+2026-06-22 13:17:08 INFO BC policy vs bots | WR mean 0.0% [dragapult 0% abomasnow 0% iono 0%]
+2026-06-22 13:17:08 INFO (prior from-scratch PPO plateaued ~14-17%; warmstart PPO with ppo_training.py --resume out/bc.pth)
+[step3] one PPO iteration warmstarted from BC 
+2026-06-22 13:17:09 INFO run 20260622_131709 | device=cuda | {'iters': 2, 'resume': 'out/bc.pth', 'workers': 1, 'games': 8, 'eval_games': 4, 'scripted_frac': 0.0, 'league_frac': 0.5, 'snapshot_every': 10, 'eval_every': 1, 'shape_coef': 0.1, 'lr': 0.0001}
+2026-06-22 13:17:09 INFO hparams | gamma=0.997 lambda=0.95 clip=0.2 lr=0.0003 ppo_epochs=4 minibatch=256 league_max=8 shape_coef=0.1 dev_scale=0.5 arch={'d_model': 128, 'num_heads': 2, 'd_feedforward': 256, 'num_layers_encoder': 2, 'num_layers_decoder': 2}
+2026-06-22 13:17:10 INFO held-out eval opponents (example_ai bots): ['dragapult', 'abomasnow', 'iono']
+2026-06-22 13:17:10 INFO opponent deck-diversity pool: 13 decks (incl. mirror)
+2026-06-22 13:17:10 INFO resumed from out/bc.pth
+2026-06-22 13:17:10 INFO learning rate 1.0e-04
+2026-06-22 13:17:10 INFO serial rollout (in-process)
+2026-06-22 13:17:10 INFO logging metrics to logs\metrics_20260622_131709.csv
+2026-06-22 13:17:12 INFO resumed model baseline WR mean 0.0% [dragapult 0% abomasnow 0% iono 0%] -- best.pth gated above this
+2026-06-22 13:17:18 INFO iter    0 |   5.7s | samples   906 | p0/p1/draw [6, 2, 0] | league 0 | ploss +0.001 vloss 0.023 ent 1.376 | WR mean 0.0% [dragapult 0% abomasnow 0% iono 0%]  <-- new best
+2026-06-22 13:17:23 INFO iter    1 |   5.0s | samples   865 | p0/p1/draw [2, 6, 0] | league 0 | ploss +0.001 vloss 0.036 ent 1.126 | WR mean 8.3% [dragapult 25% abomasnow 0% iono 0%]  <-- new best
+[step4] submission agent loads trained weights 
+=== dry run done === 

@@ -2,7 +2,6 @@ import os
 
 import torch
 
-from cg.api import to_observation_class
 from nn_agent import load_model, mcts_agent, policy_step
 
 USE_SEARCH = False

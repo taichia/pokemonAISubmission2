@@ -5,6 +5,8 @@ At inference the policy is greedy over legal candidate actions -- no forward sea
 so no hidden opponent state ever needs to be guessed.
 """
 
+import os
+
 import torch
 
 from cg.api import to_observation_class
@@ -15,6 +17,14 @@ from features import (
     get_decoder_input,
     get_encoder_input,
 )
+
+# Inference-time search budget (used only when main.py sets USE_SEARCH = True).
+# Larger = stronger but slower per move; tune to the competition's per-move time limit.
+SEARCH_SIMS = 24            # PUCT simulations per determinization
+SEARCH_DETERMINIZATIONS = 4  # belief samples averaged (PIMC width)
+
+_archetypes = None  # lazily-loaded opponent-deck prior (see belief.load_archetypes)
+_rng = None
 
 # Architecture must match what ppo_training.py saved. Kept in the checkpoint so we
 # can rebuild the right shape regardless of hyperparameter changes.
@@ -49,7 +59,45 @@ def policy_step(obs_dict: dict, your_deck: list[int], model: MyModel) -> list[in
     return actions[best]
 
 
-# Optional: only used when main.py sets USE_SEARCH = True. The model-free policy is
-# the intended path; this is a thin stub so the import in main.py never fails.
+def _ensure_belief(your_deck: list[int]):
+    """Lazily build the opponent-archetype prior. Returns None if the archetype decks
+    aren't shipped alongside the agent (so we can fall back to the model-free policy)."""
+    global _archetypes, _rng
+    if _archetypes is None:
+        import random
+
+        from belief import Archetype, load_archetypes
+        try:
+            deck_csv = "deck.csv" if os.path.exists("deck.csv") else \
+                "/kaggle_simulations/agent/deck.csv"
+            _archetypes = load_archetypes(
+                include_own_deck=deck_csv if os.path.exists(deck_csv) else None)
+        except Exception:
+            # No archetype pack available -> mark as "empty" so we stop retrying.
+            _archetypes = []
+        # Always include our own deck as a possible (mirror) archetype.
+        if _archetypes is not None and not any(
+                a.label == "__mirror__" for a in _archetypes):
+            _archetypes = [Archetype("__mirror__", your_deck)] + list(_archetypes)
+        _rng = random.Random(0)
+    return _archetypes or None
+
+
 def mcts_agent(obs_dict: dict, your_deck: list[int], model: MyModel) -> list[int]:
-    return policy_step(obs_dict, your_deck, model)
+    """Determinized PUCT at inference. Falls back to the greedy policy on the initial
+    deck-selection observation, when no archetype prior is available, or on any search
+    error -- the submission must never crash."""
+    if obs_dict.get("select") is None:
+        return your_deck  # initial selection: return the 60-card deck
+    archetypes = _ensure_belief(your_deck)
+    if archetypes is None:
+        return policy_step(obs_dict, your_deck, model)
+    try:
+        from mcts import run_mcts
+        action, _pi, _actions = run_mcts(
+            obs_dict, your_deck, model, archetypes,
+            n_sims=SEARCH_SIMS, n_determinizations=SEARCH_DETERMINIZATIONS,
+            rng=_rng, add_noise=False, temperature=0.0)
+        return action
+    except Exception:
+        return policy_step(obs_dict, your_deck, model)

@@ -42,3 +42,7 @@ Thumbs.db
 
 # Note: cg/cg.dll and cg/libcg.so are intentionally committed (engine dependencies),
 # so .so / .dll files are deliberately NOT ignored here.
+
+# --- From-scratch ExIt pipeline artifacts ---
+out_exit/
+out_exit_run*.log
