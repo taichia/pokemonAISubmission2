@@ -46,3 +46,11 @@ Thumbs.db
 # --- From-scratch ExIt pipeline artifacts ---
 out_exit/
 out_exit_run*.log
+out_deep/
+out_deep_run*.log
+out_warm/
+out_warm_run*.log
+out_exploit/
+out_exploit_run*.log
+out_fresh/
+out_fresh_run*.log

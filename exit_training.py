@@ -66,17 +66,31 @@ class Sample:
 # ---------------------------------------------------------------------------
 # Self-play
 # ---------------------------------------------------------------------------
-def play_one_game(game_idx, deck, model, archetypes, pool, sims, dets, temp_moves,
-                  max_moves, rng):
-    """Play one net-vs-net game (MCTS both sides). Returns (learner_samples, result, learner).
+def _random_legal(obs, rng):
+    sel = obs["select"]
+    n, k = len(sel["option"]), sel["maxCount"]
+    return rng.sample(range(n), min(k, n)) if k > 0 else []
 
-    The learner always pilots `deck`; the opponent pilots a random pool deck. Only the
-    learner's non-trivial decisions are collected (training is about playing our deck).
-    A game exceeding `max_moves` is abandoned (returns no samples) so one pathological game
-    can't stall the worker pool at an iteration boundary."""
+
+def play_one_game(game_idx, deck, model, archetypes, pool, sims, dets, temp_moves,
+                  max_moves, rng, opponents=None, scripted_frac=0.0):
+    """Play one game; return (learner_samples, result, learner).
+
+    The learner always pilots `deck` and chooses via MCTS; only its non-trivial decisions
+    are collected (training is about playing our deck). The opponent is EITHER a scripted
+    bot piloting its own deck (probability `scripted_frac` -- exploitative training against
+    the strong reference opponents) OR the current net piloting a random pool deck (mirror-
+    style self-play). A game past `max_moves` is abandoned so one pathological game can't
+    stall the worker pool."""
     from cg.api import to_observation_class
 
-    opp_deck = rng.choice(pool)
+    use_bot = bool(opponents) and rng.random() < scripted_frac
+    if use_bot:
+        bot = rng.choice(opponents)
+        opp_deck, bot_act = bot.deck, bot.agent
+    else:
+        opp_deck, bot_act = rng.choice(pool), None
+
     learner = game_idx % 2  # alternate first/second player
     decks = [deck, opp_deck] if learner == 0 else [opp_deck, deck]
     obs, sd = battle_start(decks[0], decks[1])
@@ -87,15 +101,25 @@ def play_one_game(game_idx, deck, model, archetypes, pool, sims, dets, temp_move
     move = 0
     while obs["current"]["result"] < 0 and move < max_moves:
         me = obs["current"]["yourIndex"]
-        deck_me = deck if me == learner else opp_deck
-        temp = 1.0 if move < temp_moves else 0.0  # explore early, exploit late
-        action, pi, actions = run_mcts(
-            obs, deck_me, model, archetypes, n_sims=sims, n_determinizations=dets,
-            rng=rng, add_noise=True, temperature=temp)
-        if me == learner and len(actions) > 1:
-            o = to_observation_class(obs)
-            game_samples.append(Sample(get_encoder_input(o, deck),
-                                       get_decoder_input(o, actions), len(actions), pi, me))
+        if me == learner:
+            temp = 1.0 if move < temp_moves else 0.0  # explore early, exploit late
+            action, pi, actions = run_mcts(
+                obs, deck, model, archetypes, n_sims=sims, n_determinizations=dets,
+                rng=rng, add_noise=True, temperature=temp)
+            if len(actions) > 1:
+                o = to_observation_class(obs)
+                game_samples.append(Sample(get_encoder_input(o, deck),
+                                           get_decoder_input(o, actions), len(actions), pi, me))
+        elif bot_act is not None:
+            try:
+                action = bot_act(obs)
+            except Exception:
+                action = _random_legal(obs, rng)  # never let a bot edge-case kill the game
+        else:
+            temp = 1.0 if move < temp_moves else 0.0
+            action, _pi, _a = run_mcts(
+                obs, opp_deck, model, archetypes, n_sims=sims, n_determinizations=dets,
+                rng=rng, add_noise=True, temperature=temp)
         obs = battle_select(action)
         move += 1
 
@@ -108,7 +132,7 @@ def play_one_game(game_idx, deck, model, archetypes, pool, sims, dets, temp_move
     return game_samples, res, learner
 
 
-def selfplay_games(n_games, deck, model, archetypes, pool, cfg, rng, log):
+def selfplay_games(n_games, deck, model, archetypes, pool, cfg, rng, log, opponents=None):
     """Single-process self-play (used when --workers <= 1)."""
     data = []
     wins = draws = 0
@@ -116,7 +140,8 @@ def selfplay_games(n_games, deck, model, archetypes, pool, cfg, rng, log):
     for g in range(n_games):
         samples, res, learner = play_one_game(
             g, deck, model, archetypes, pool, cfg.sims, cfg.determinizations,
-            cfg.temp_moves, cfg.max_moves, rng)
+            cfg.temp_moves, cfg.max_moves, rng,
+            opponents=opponents, scripted_frac=cfg.scripted_frac)
         data.extend(samples)
         wins += (res == learner)
         draws += (res == 2)
@@ -125,7 +150,7 @@ def selfplay_games(n_games, deck, model, archetypes, pool, cfg, rng, log):
                      g + 1, n_games, len(data), 100 * wins / (g + 1), time.time() - t0)
     log.info("collected %d samples from %d games (learner WR %.1f%%, draws %d)",
              len(data), n_games, 100 * wins / n_games, draws)
-    return data
+    return data, wins / n_games
 
 
 # ---------------------------------------------------------------------------
@@ -138,7 +163,7 @@ def selfplay_games(n_games, deck, model, archetypes, pool, cfg, rng, log):
 _W = {}
 
 
-def _worker_init(arch_kwargs, deck):
+def _worker_init(arch_kwargs, deck, scripted_frac):
     import torch as _t
     _t.set_num_threads(1)  # prevent BLAS thread oversubscription across processes
     from belief import load_archetypes
@@ -148,6 +173,12 @@ def _worker_init(arch_kwargs, deck):
     _W["pool"] = [a.deck for a in _W["archetypes"]]
     _W["deck"] = deck
     _W["version"] = -1
+    _W["scripted_frac"] = scripted_frac
+    if scripted_frac > 0:
+        from opponents import load_opponents
+        _W["opponents"] = load_opponents()  # per-process bot instances (stateful)
+    else:
+        _W["opponents"] = None
 
 
 def _worker_play(task):
@@ -162,17 +193,45 @@ def _worker_play(task):
         _W["version"] = version
     rng = _random.Random(seed)
     return play_one_game(game_idx, _W["deck"], _W["model"], _W["archetypes"],
-                         _W["pool"], sims, dets, temp_moves, max_moves, rng)
+                         _W["pool"], sims, dets, temp_moves, max_moves, rng,
+                         opponents=_W["opponents"], scripted_frac=_W["scripted_frac"])
 
 
 def selfplay_parallel(worker_pool, n_games, weights_path, version, cfg, rng, log):
-    """Parallel self-play over a persistent worker pool. Same return shape as selfplay_games."""
+    """Parallel self-play with a stall watchdog. Returns (samples, learner_wr, pool_dead).
+
+    If a worker deadlocks (e.g. a native hang in the cg engine on one game), the missing
+    results would otherwise freeze the whole run forever. So we pull results with a per-game
+    timeout: if none arrives within `cfg.game_timeout` seconds, we abandon the remaining
+    games for this iteration, terminate the (now-suspect) pool, and signal the caller to
+    recreate it. Checkpointing is per-iteration, so the cost of a stall is at most the
+    games we drop from one iteration."""
+    import multiprocessing as _mp
+    HEARTBEAT = 90.0  # log a "still running" line if no game completes within this long
     tasks = [(g, weights_path, version, cfg.sims, cfg.determinizations, cfg.temp_moves,
               cfg.max_moves, rng.randrange(2 ** 31)) for g in range(n_games)]
     data = []
     wins = draws = done = 0
-    t0 = time.time()
-    for samples, res, learner in worker_pool.imap_unordered(_worker_play, tasks):
+    pool_dead = False
+    t0 = last_complete = time.time()
+    results = worker_pool.imap_unordered(_worker_play, tasks)
+    while done < n_games:
+        try:
+            # Poll on a short heartbeat so the slow tail of an iteration is visibly alive
+            # (the both-sides-search games cluster late and can take minutes each).
+            samples, res, learner = results.next(timeout=HEARTBEAT)
+        except _mp.TimeoutError:
+            idle = time.time() - last_complete
+            if idle > cfg.game_timeout:  # a real stall (worker deadlock) -> recycle the pool
+                log.warning("  self-play STALL: no game finished in %.0fs; abandoning %d "
+                            "remaining games and recycling the pool", idle, n_games - done)
+                worker_pool.terminate()
+                pool_dead = True
+                break
+            log.info("  selfplay %d/%d | still running (%.0fs since last game, %.0fs total)",
+                     done, n_games, idle, time.time() - t0)
+            continue
+        last_complete = time.time()
         data.extend(samples)
         wins += (res == learner)
         draws += (res == 2)
@@ -181,8 +240,8 @@ def selfplay_parallel(worker_pool, n_games, weights_path, version, cfg, rng, log
             log.info("  selfplay %d/%d | %d samples | learner WR %.0f%% | %.0fs",
                      done, n_games, len(data), 100 * wins / done, time.time() - t0)
     log.info("collected %d samples from %d games (learner WR %.1f%%, draws %d, %.0fs)",
-             len(data), n_games, 100 * wins / n_games, draws, time.time() - t0)
-    return data
+             len(data), done, 100 * wins / max(1, done), draws, time.time() - t0)
+    return data, wins / max(1, done), pool_dead
 
 
 # ---------------------------------------------------------------------------
@@ -244,12 +303,14 @@ def train(model, optimizer, data, cfg, log):
             tot_p += pol_loss.item() * bs
             tot_v += vloss.item() * bs
             seen += bs
+        last_pce, last_vmse = tot_p / seen, tot_v / seen
         log.info("  epoch %d/%d | policy_ce %.4f | value_mse %.4f",
-                 ep + 1, cfg.epochs, tot_p / seen, tot_v / seen)
+                 ep + 1, cfg.epochs, last_pce, last_vmse)
+    return last_pce, last_vmse
 
 
 # ---------------------------------------------------------------------------
-# Gating: greedy-policy win-rate vs the held-out scripted bots
+# Evaluation signals (greedy = the deployment policy)
 # ---------------------------------------------------------------------------
 @torch.inference_mode()
 def _policy_action(obs_dict, deck, model, temp, rng, device):
@@ -314,6 +375,39 @@ def evaluate_vs_bots(model, deck, n_games, temp, log, seed=12345):
     return mean, per
 
 
+@torch.inference_mode()
+def eval_vs_random(model, deck, pool, n_games, log, seed=777):
+    """Greedy win-rate vs a uniform-random opponent piloting random pool decks.
+
+    Unlike the vs-bots gate (which saturates at the ~2-3% noise floor because the scripted
+    experts beat everything), this has real resolution -- a competent net wins 60-70% here,
+    so it tracks whether the net is actually getting stronger between iterations."""
+    model.eval()
+    device = next(model.parameters()).device
+    rng = random.Random(seed)
+    wins = n = 0
+    for g in range(n_games):
+        learner = g % 2
+        opp_deck = rng.choice(pool)
+        decks = [deck, opp_deck] if learner == 0 else [opp_deck, deck]
+        obs, sd = battle_start(decks[0], decks[1])
+        if sd.errorPlayer >= 0:
+            raise ValueError(f"deck error type {sd.errorType}")
+        while obs["current"]["result"] < 0:
+            me = obs["current"]["yourIndex"]
+            if me == learner:
+                obs = battle_select(_policy_action(obs, deck, model, 0.0, rng, device))
+            else:
+                obs = battle_select(_random_legal(obs, rng))
+        res = obs["current"]["result"]
+        battle_finish()
+        wins += (res == learner)
+        n += 1
+    wr = wins / n
+    log.info("eval vs random | greedy WR %.1f%% (%d games)", 100 * wr, n)
+    return wr
+
+
 # ---------------------------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser()
@@ -329,10 +423,17 @@ def main():
     ap.add_argument("--batch-size", type=int, default=256)
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--value-coef", type=float, default=1.0)
-    ap.add_argument("--eval-games", type=int, default=30,
-                    help="games per held-out bot when gating (0 to skip)")
-    ap.add_argument("--eval-temp", type=float, default=0.4,
-                    help="learner sampling temperature during eval (0 = greedy/deterministic)")
+    ap.add_argument("--scripted-frac", type=float, default=0.5,
+                    help="fraction of self-play games whose opponent is a scripted bot "
+                         "(exploitative training vs the real opponents; 0 = pure self-play)")
+    ap.add_argument("--eval-games", type=int, default=40,
+                    help="games per bot when gating vs bots (0 to skip)")
+    ap.add_argument("--eval-temp", type=float, default=0.0,
+                    help="eval sampling temperature (0 = greedy = the deployment policy)")
+    ap.add_argument("--eval-random-games", type=int, default=60,
+                    help="games for the high-resolution vs-random progress signal (0 to skip)")
+    ap.add_argument("--snapshot-every", type=int, default=5,
+                    help="also save out/iterNN.pth every N iterations (for arena ranking)")
     # Network architecture (stored in the checkpoint, so inference rebuilds the right shape).
     ap.add_argument("--d-model", type=int, default=128)
     ap.add_argument("--heads", type=int, default=4)
@@ -344,6 +445,11 @@ def main():
     ap.add_argument("--resume", default=None, help="checkpoint to warmstart from")
     ap.add_argument("--workers", type=int, default=0,
                     help="parallel self-play workers (0 = auto = cpu_count-1, 1 = single process)")
+    ap.add_argument("--game-timeout", type=float, default=900.0,
+                    help="seconds with no completed game before a stalled pool is recycled")
+    ap.add_argument("--metrics-file", default=None,
+                    help="append metrics to this existing CSV and continue its iteration "
+                         "numbering (for resumed runs); default writes a new metrics/<tag>.csv")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", default="out")
     args = ap.parse_args()
@@ -373,6 +479,15 @@ def main():
     pool = [a.deck for a in archetypes]  # opponents pilot any pool deck (incl. mirror)
     log.info("deck loaded; %d archetypes in belief/opponent pool; arch=%s", len(archetypes), arch)
 
+    # Scripted bots as exploitative training opponents (single-process path; workers load
+    # their own instances). Also used for the vs-bots gate.
+    sp_opponents = None
+    if args.scripted_frac > 0:
+        from opponents import load_opponents
+        sp_opponents = load_opponents()
+        log.info("scripted-frac %.2f: %d bots in self-play opponent mix (%s)",
+                 args.scripted_frac, len(sp_opponents), ", ".join(o.label for o in sp_opponents))
+
     model = MyModel(**arch).to(DEVICE)
     if args.resume and os.path.exists(args.resume):
         ckpt = torch.load(args.resume, map_location=DEVICE)
@@ -383,51 +498,106 @@ def main():
         log.info("training from scratch (random init)")
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
-    # Spin up the persistent self-play worker pool (once for the whole run).
+    # Self-play worker pool, via a factory so the stall-watchdog can recreate it.
     import multiprocessing as mp
     n_workers = args.workers if args.workers > 0 else max(1, (os.cpu_count() or 2) - 1)
-    worker_pool = None
-    if n_workers > 1:
-        ctx = mp.get_context("spawn")  # required on Windows; safe with CUDA in the parent
-        worker_pool = ctx.Pool(n_workers, initializer=_worker_init, initargs=(arch, deck))
-        log.info("self-play: %d parallel workers", n_workers)
-    else:
-        log.info("self-play: single process")
+    ctx = mp.get_context("spawn")  # required on Windows; safe with CUDA in the parent
+
+    def _make_pool():
+        return ctx.Pool(n_workers, initializer=_worker_init,
+                        initargs=(arch, deck, args.scripted_frac))
+
+    worker_pool = _make_pool() if n_workers > 1 else None
+    log.info("self-play: %s", f"{n_workers} parallel workers" if worker_pool else "single process")
     selfplay_weights = os.path.join(args.out, "_selfplay.pth")
 
+    # Git-trackable, easily-parsed metrics: one CSV row per iteration, for graphing.
+    # --metrics-file appends to an existing CSV and continues its iteration numbering and
+    # wall-clock (resumed runs); otherwise a fresh metrics/<tag>.csv is started.
+    import csv as _csv
+    os.makedirs("metrics", exist_ok=True)
+    cols = ["iter", "samples", "selfplay_wr", "policy_ce", "value_mse", "vs_random_wr",
+            "vs_bots_wr", "vs_dragapult", "vs_abomasnow", "vs_iono", "selfplay_secs", "wall_secs"]
+    start_iter, wall_offset = 0, 0.0
+    if args.metrics_file and os.path.exists(args.metrics_file):
+        metrics_path = args.metrics_file
+        with open(metrics_path, newline="") as f:
+            prev = [r for r in _csv.DictReader(f) if r.get("iter")]
+        if prev:
+            start_iter = max(int(r["iter"]) for r in prev)
+            wall_offset = max((float(r["wall_secs"]) for r in prev if r.get("wall_secs")),
+                              default=0.0)
+        log.info("appending metrics to %s; continuing from iter %d", metrics_path, start_iter)
+    else:
+        metrics_path = args.metrics_file or os.path.join("metrics", f"{run_tag}.csv")
+        with open(metrics_path, "w", newline="") as f:
+            _csv.writer(f).writerow(cols)
+        log.info("metrics -> %s (one row per iteration)", metrics_path)
+    total_iters = start_iter + args.iters
+
+    def _r(x):  # round numbers, blank for missing
+        return round(x, 4) if isinstance(x, (int, float)) else ""
+
+    run_t0 = time.time()
     replay = []
     best_wr = -1.0
     try:
         for it in range(args.iters):
-            log.info("=== iteration %d/%d ===", it + 1, args.iters)
+            it_label = start_iter + it + 1
+            log.info("=== iteration %d/%d ===", it_label, total_iters)
             model.eval()
+            sp_t0 = time.time()
             if worker_pool is not None:
                 # Publish current weights for workers to pick up (version = iteration).
                 torch.save({"state_dict": model.state_dict(), "arch": arch}, selfplay_weights)
-                samples = selfplay_parallel(worker_pool, args.games, selfplay_weights, it,
-                                            args, rng, log)
+                samples, sp_wr, pool_dead = selfplay_parallel(
+                    worker_pool, args.games, selfplay_weights, it_label, args, rng, log)
+                if pool_dead:  # watchdog terminated the stalled pool -> rebuild a fresh one
+                    worker_pool.join()
+                    worker_pool = _make_pool()
+                    log.info("recreated worker pool after stall")
             else:
-                samples = selfplay_games(args.games, deck, model, archetypes, pool, args, rng, log)
+                samples, sp_wr = selfplay_games(args.games, deck, model, archetypes, pool, args,
+                                                rng, log, opponents=sp_opponents)
+            selfplay_secs = time.time() - sp_t0
+            if not samples:
+                log.warning("no samples this iteration (all games abandoned); skipping update")
+                continue
             replay.append(samples)
             replay = replay[-args.replay_iters:]
             buffer = [s for chunk in replay for s in chunk]
             log.info("training on %d samples (%d recent iters)", len(buffer), len(replay))
-            train(model, optimizer, buffer, args, log)
+            pce, vmse = train(model, optimizer, buffer, args, log)
 
             torch.save({"state_dict": model.state_dict(), "arch": arch},
                        os.path.join(args.out, "last.pth"))
+            if args.snapshot_every > 0 and it_label % args.snapshot_every == 0:
+                snap = os.path.join(args.out, f"iter{it_label:02d}.pth")
+                torch.save({"state_dict": model.state_dict(), "arch": arch}, snap)
+                log.info("snapshot -> %s (rank checkpoints with arena.py)", snap)
+
+            rnd_wr = eval_vs_random(model, deck, pool, args.eval_random_games, log) \
+                if args.eval_random_games > 0 else None
+            bot_mean, bot_per = None, {}
             if args.eval_games > 0:
-                mean, _ = evaluate_vs_bots(model, deck, args.eval_games, args.eval_temp, log)
-                if mean > best_wr:
-                    best_wr = mean
+                bot_mean, bot_per = evaluate_vs_bots(model, deck, args.eval_games,
+                                                     args.eval_temp, log)
+                if bot_mean > best_wr:
+                    best_wr = bot_mean
                     torch.save({"state_dict": model.state_dict(), "arch": arch},
                                os.path.join(args.out, "best.pth"))
-                    log.info("** new best (WR %.1f%%) -> %s/best.pth", 100 * best_wr, args.out)
+                    log.info("** new best vs-bots WR %.1f%% -> %s/best.pth", 100 * best_wr, args.out)
+
+            with open(metrics_path, "a", newline="") as f:
+                _csv.writer(f).writerow([
+                    it_label, len(samples), _r(sp_wr), _r(pce), _r(vmse), _r(rnd_wr),
+                    _r(bot_mean), _r(bot_per.get("dragapult")), _r(bot_per.get("abomasnow")),
+                    _r(bot_per.get("iono")), _r(selfplay_secs), _r(wall_offset + time.time() - run_t0)])
     finally:
         if worker_pool is not None:
-            worker_pool.close()
+            worker_pool.terminate()  # force-kill workers so none are orphaned
             worker_pool.join()
-    log.info("done. best held-out WR %.1f%%", 100 * best_wr)
+    log.info("done. best vs-bots WR %.1f%%. metrics: %s", 100 * best_wr, metrics_path)
 
 
 if __name__ == "__main__":
